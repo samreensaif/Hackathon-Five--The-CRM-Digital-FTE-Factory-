@@ -109,12 +109,13 @@ services:
         value: "2"
 
   # ── 3. PostgreSQL Database ────────────────────────────────────────────
-databases:
-  - name: fte-postgres
+  - type: pserv
+    name: fte-postgres
     databaseName: fte_production
     user: fte
     region: oregon
     plan: starter          # upgrade to standard for production workloads
+    ipAllowList: []        # allow all Render internal services to connect
     # pgvector extension must be enabled after first deploy:
     #   psql $DATABASE_URL -c "CREATE EXTENSION IF NOT EXISTS vector;"
     # Then run: psql $DATABASE_URL < database/schema.sql
