@@ -111,8 +111,6 @@ services:
   # ── 3. PostgreSQL Database ────────────────────────────────────────────
   - type: pserv
     name: fte-postgres
-    databaseName: fte_production
-    user: fte
     region: oregon
     plan: starter          # upgrade to standard for production workloads
     ipAllowList: []        # allow all Render internal services to connect

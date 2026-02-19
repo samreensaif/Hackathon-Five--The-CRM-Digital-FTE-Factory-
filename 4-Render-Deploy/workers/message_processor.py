@@ -61,13 +61,7 @@ logging.basicConfig(
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
-    "postgresql://{user}:{password}@{host}:{port}/{db}".format(
-        user=os.environ.get("POSTGRES_USER", "fte"),
-        password=os.environ.get("POSTGRES_PASSWORD", "fte_secret"),
-        host=os.environ.get("POSTGRES_HOST", "localhost"),
-        port=os.environ.get("POSTGRES_PORT", "5432"),
-        db=os.environ.get("POSTGRES_DB", "fte_production"),
-    ),
+    "postgresql://localhost/fte_production",  # local dev fallback
 )
 
 POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "2"))
