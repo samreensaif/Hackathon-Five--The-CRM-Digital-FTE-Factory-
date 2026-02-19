@@ -1,0 +1,120 @@
+# Render.com Infrastructure-as-Code
+# ====================================
+# Defines three services that Render will create and manage:
+#
+#   1. fte-postgres  — Managed PostgreSQL database (with pgvector extension)
+#   2. fte-api       — FastAPI web service (handles webhooks + REST endpoints)
+#   3. fte-worker    — Background worker (polls queue + runs the AI agent)
+#
+# Deploy:
+#   render blueprint apply   (or push to the connected GitHub repo)
+#
+# Docs: https://render.com/docs/blueprint-spec
+
+services:
+  # ── 1. API Web Service ────────────────────────────────────────────────
+  - type: web
+    name: fte-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerCommand: uvicorn api.main:app --host 0.0.0.0 --port 8000
+    region: oregon
+    plan: starter          # upgrade to standard for production traffic
+
+    healthCheckPath: /health
+
+    envVars:
+      # PostgreSQL — injected automatically from the fte-postgres service below
+      - key: DATABASE_URL
+        fromDatabase:
+          name: fte-postgres
+          property: connectionString
+
+      # OpenAI — set in Render dashboard (Environment → Secret Files / Env Vars)
+      - key: OPENAI_API_KEY
+        sync: false
+
+      # Gmail integration
+      - key: GMAIL_CREDENTIALS_PATH
+        value: /etc/secrets/gmail_credentials.json
+      - key: GMAIL_TOKEN_PATH
+        value: /etc/secrets/gmail_token.json
+      - key: GMAIL_SUPPORT_EMAIL
+        sync: false
+
+      # Twilio / WhatsApp
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_WHATSAPP_NUMBER
+        sync: false
+      - key: TWILIO_WEBHOOK_URL
+        sync: false
+
+      # Application settings
+      - key: ENVIRONMENT
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      - key: CORS_ORIGINS
+        value: https://your-frontend.onrender.com
+
+      # Worker polling interval (seconds) — shared with worker service
+      - key: POLL_INTERVAL_SECONDS
+        value: "2"
+
+  # ── 2. Worker Background Service ──────────────────────────────────────
+  - type: worker
+    name: fte-worker
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerCommand: python -m workers.message_processor
+    region: oregon
+    plan: starter
+
+    envVars:
+      # PostgreSQL — same database as the API
+      - key: DATABASE_URL
+        fromDatabase:
+          name: fte-postgres
+          property: connectionString
+
+      # OpenAI
+      - key: OPENAI_API_KEY
+        sync: false
+
+      # Gmail (for sending replies)
+      - key: GMAIL_CREDENTIALS_PATH
+        value: /etc/secrets/gmail_credentials.json
+      - key: GMAIL_TOKEN_PATH
+        value: /etc/secrets/gmail_token.json
+      - key: GMAIL_SUPPORT_EMAIL
+        sync: false
+
+      # Twilio (for WhatsApp replies)
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_WHATSAPP_NUMBER
+        sync: false
+
+      # Application settings
+      - key: ENVIRONMENT
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      - key: POLL_INTERVAL_SECONDS
+        value: "2"
+
+  # ── 3. PostgreSQL Database ────────────────────────────────────────────
+databases:
+  - name: fte-postgres
+    databaseName: fte_production
+    user: fte
+    region: oregon
+    plan: starter          # upgrade to standard for production workloads
+    # pgvector extension must be enabled after first deploy:
+    #   psql $DATABASE_URL -c "CREATE EXTENSION IF NOT EXISTS vector;"
+    # Then run: psql $DATABASE_URL < database/schema.sql
