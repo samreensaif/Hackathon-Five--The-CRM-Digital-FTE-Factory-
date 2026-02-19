@@ -24,7 +24,6 @@ databases:
   - name: fte-postgres
     databaseName: fte_production
     user: fte_user
-    plan: starter
     region: oregon
 
 # ── Application Services ─────────────────────────────────────────────────────
