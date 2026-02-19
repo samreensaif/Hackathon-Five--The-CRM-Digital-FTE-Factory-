@@ -1,0 +1,574 @@
+# Agent Skills Definition — Customer Success Digital FTE
+# ======================================================
+# Defines the 6 core capabilities discovered during incubation (Phase 1).
+# Each skill maps to a tested component in prototype.py and is exposed
+# via the MCP server (mcp_server.py) for LLM-client consumption.
+#
+# Version: 0.2.0  (aligned with prototype v0.2)
+# Date:    2026-02-16
+
+agent:
+  name: Customer Success Digital FTE
+  version: 0.2.0
+  description: >
+    24/7 AI customer support agent for TaskFlow (project management SaaS).
+    Handles Gmail, WhatsApp, and Web Form inquiries using rule-based
+    escalation, TF-IDF doc retrieval, keyword sentiment analysis, and
+    cross-channel conversation continuity.
+  supported_channels:
+    - gmail
+    - whatsapp
+    - web-form
+  escalation_accuracy: "98% (61/62 tickets)"
+  test_suite: "61/61 tests passing"
+
+# ─────────────────────────────────────────────────────────────────────────
+skills:
+
+  # ── Skill 1: Knowledge Retrieval ─────────────────────────────────────
+  - name: knowledge_retrieval
+    description: >
+      Search TaskFlow product documentation using TF-IDF relevance scoring
+      to find the most relevant doc sections for a customer's question.
+      Splits product-docs.md into sections by H2/H3 headings, builds an
+      IDF index, and ranks sections by weighted term frequency.
+    when_to_use:
+      - Customer asks a how-to question about TaskFlow features
+      - Customer reports a bug and the agent needs troubleshooting steps
+      - Customer asks about integrations, pricing, or feature capabilities
+      - Any non-escalation ticket where a doc-grounded response is needed
+    inputs:
+      - name: query
+        type: string
+        description: Natural language question or keywords from the customer message
+      - name: max_results
+        type: integer
+        default: 5
+        description: Maximum number of doc sections to return (1-10)
+    outputs:
+      - name: relevant_sections
+        type: list[dict]
+        description: >
+          Ranked list of doc sections, each with "title" (section heading)
+          and "body" (section content, truncated to 500 chars)
+      - name: match_count
+        type: integer
+        description: Number of sections returned (0 = no relevant docs found)
+    success_criteria:
+      - Returns the correct product-docs section for at least 80% of how-to queries
+      - Title matches are weighted 3x over body matches for relevance
+      - Returns empty list (not an error) when no docs match the query
+    implementation:
+      class: KnowledgeBase
+      file: src/agent/prototype.py
+      technique: TF-IDF with IDF weights and title boost (3x)
+      data_source: context/product-docs.md (605 lines, ~50 sections)
+    mcp_tool: search_knowledge_base
+    examples:
+      - input:
+          query: "How do I set up recurring tasks?"
+          max_results: 3
+        expected_behavior: >
+          Returns Task Management section and FAQ Q20 about recurring tasks.
+          Title match on "recurring" boosts the correct section.
+      - input:
+          query: "Slack integration not working"
+          max_results: 5
+        expected_behavior: >
+          Returns Integrations section with Slack setup instructions.
+          IDF gives "Slack" high weight since it appears in few sections.
+    performance_baseline:
+      doc_retrieval_accuracy: "~80% correct top-1 section for how-to questions"
+      known_weakness: >
+        TF-0022 (recurring tasks) returns the general Task Management section
+        instead of the specific FAQ Q20. Phrase-level matching or embeddings
+        would fix this. Addressed in Phase 2 with RAG.
+
+  # ── Skill 2: Sentiment Analysis ──────────────────────────────────────
+  - name: sentiment_analysis
+    description: >
+      Analyze the emotional tone of a customer message using keyword-based
+      scoring. Returns a score from -1.0 (very negative) to +1.0 (very
+      positive). Used to adjust response empathy level and as an escalation
+      signal.
+    when_to_use:
+      - Every incoming customer message (automatic in the pipeline)
+      - When deciding whether to escalate based on customer frustration
+      - When selecting empathy level for response formatting
+      - When tracking sentiment trends across a multi-turn conversation
+    inputs:
+      - name: text
+        type: string
+        description: The customer message text to analyze
+    outputs:
+      - name: score
+        type: float
+        range: "-1.0 to +1.0"
+        description: Numeric sentiment score
+      - name: label
+        type: string
+        enum: [positive, neutral, negative]
+        description: "Categorical label (positive >= 0.3, negative <= -0.3)"
+      - name: confidence
+        type: string
+        enum: [high, medium, low]
+        description: "Confidence based on score magnitude (high >= 0.7, medium >= 0.3)"
+    success_criteria:
+      - Direction accuracy (positive/negative/neutral agreement with ground truth) >= 75%
+      - Extreme negative sentiment (ALL CAPS, profanity, strong negative words) always scores < -0.5
+      - Greeting messages and neutral factual reports score between -0.2 and +0.2
+      - Sentiment score correctly drives empathy selection in response formatting
+    implementation:
+      class: SentimentAnalyzer
+      file: src/agent/prototype.py
+      technique: >
+        Keyword-based scoring with weighted positive/negative lexicons,
+        negation awareness (flips sentiment of next word), intensifier
+        support (very, extremely = 1.5x), ALL CAPS penalty (-0.3),
+        exclamation amplification
+      lexicon_size:
+        positive_words: 34 (weights 1-2)
+        negative_words: 38 (weights 1-3)
+    mcp_tool: analyze_sentiment
+    examples:
+      - input:
+          text: "This is absolutely terrible, your product is useless garbage"
+        expected_output:
+          score: -0.9
+          label: negative
+          confidence: high
+      - input:
+          text: "Thanks! The new feature is working great"
+        expected_output:
+          score: 0.6
+          label: positive
+          confidence: medium
+      - input:
+          text: "How do I export my data to CSV?"
+        expected_output:
+          score: 0.0
+          label: neutral
+          confidence: low
+    performance_baseline:
+      mean_absolute_error: "0.43 vs ground-truth (0-1 scale)"
+      direction_accuracy: "~75%"
+      known_weakness: >
+        Tends toward extreme values (-1.0 or +1.0) because a single strong
+        word dominates. Technical words like "error", "bug", "crash" score
+        negative even when used factually. Phase 2 will use LLM-based
+        sentiment for better calibration.
+
+  # ── Skill 3: Escalation Decision ─────────────────────────────────────
+  - name: escalation_decision
+    description: >
+      Determine whether a customer ticket requires human agent intervention
+      using rule-based pattern matching across 12 escalation categories.
+      Combines regex patterns, sentiment thresholds, ALL CAPS detection,
+      and customer plan context to make the escalation decision.
+    when_to_use:
+      - Every incoming ticket (automatic in the pipeline)
+      - When sentiment trend analysis detects sustained negativity
+      - When confidence score falls below threshold (< 0.4 = immediate escalation)
+      - When customer explicitly requests a human agent
+    inputs:
+      - name: message
+        type: string
+        description: The full customer message text
+      - name: subject
+        type: string
+        description: Ticket subject line (if available)
+      - name: customer_plan
+        type: string
+        enum: [free, pro, enterprise]
+        description: Customer's plan tier (affects escalation thresholds)
+      - name: sentiment_score
+        type: float
+        description: Sentiment score from sentiment_analysis skill
+      - name: conversation_history
+        type: list[Message]
+        description: Prior messages in the conversation (for trend analysis)
+    outputs:
+      - name: should_escalate
+        type: boolean
+        description: Whether the ticket should be routed to a human agent
+      - name: escalation_reason
+        type: string
+        description: Human-readable reason for escalation (empty if not escalating)
+      - name: category
+        type: string
+        enum: [billing, legal, security, account, human_requested, churn_risk,
+               angry, data_loss, critical_enterprise_bug, account_lockout,
+               stuck_operations, repeat_contact]
+        description: Escalation category for routing to the correct team
+      - name: confidence_score
+        type: float
+        range: "0.0 to 1.0"
+        description: >
+          Agent confidence in handling the ticket. Base 0.5, adjusted by
+          doc matches (+0.2), clear intent (+0.15), easy category (+0.1),
+          short message (-0.15), negative sentiment (-0.1).
+    success_criteria:
+      - Escalation accuracy >= 95% on the 62-ticket test dataset
+      - Zero false positives on legal keyword (no "legal entity" triggers)
+      - All billing disputes, data loss, and security issues always escalate
+      - Enterprise + critical severity always escalates
+      - Sentiment-based auto-escalation after 3+ consecutive negative messages
+    implementation:
+      class: EscalationEngine
+      file: src/agent/prototype.py
+      technique: >
+        Two-tier regex matching: ALWAYS_ESCALATE (4 categories: billing,
+        legal, security, account) and LIKELY_ESCALATE (8 categories:
+        human_requested, churn_risk, angry, data_loss, critical_enterprise_bug,
+        account_lockout, stuck_operations, repeat_contact). Plus sentiment
+        threshold (< 0.15 = escalate), ALL CAPS detection, and
+        ConversationManager sentiment trend analysis.
+      pattern_count: "~60 regex patterns across 12 categories"
+    mcp_tool: escalate_to_human
+    examples:
+      - input:
+          message: "I want a full refund. You charged me $49 and I never agreed to this."
+          customer_plan: pro
+        expected_output:
+          should_escalate: true
+          category: billing
+          escalation_reason: "Billing issue detected (refund/dispute/pricing)"
+      - input:
+          message: "How do I add a new column to my Kanban board?"
+          customer_plan: free
+        expected_output:
+          should_escalate: false
+          category: ""
+          confidence_score: 0.75
+      - input:
+          message: "I've been locked out after enabling 2FA and my recovery codes don't work"
+          customer_plan: enterprise
+        expected_output:
+          should_escalate: true
+          category: account_lockout
+    performance_baseline:
+      accuracy: "98% (61/62 tickets)"
+      false_positives: 0
+      false_negatives: 1
+      remaining_false_negative: >
+        TF-0015: Enterprise dashboard performance degradation. "Nearly
+        unusable" and "affects all users" are ~100 chars apart, exceeding
+        regex proximity matching. Requires full-context NLP.
+
+  # ── Skill 4: Channel Adaptation ──────────────────────────────────────
+  - name: channel_adaptation
+    description: >
+      Format agent responses according to the delivery channel's constraints
+      and brand voice guidelines. Applies greeting/closing conventions,
+      character limits, sentiment-driven empathy, and structural formatting
+      per channel.
+    when_to_use:
+      - Every outgoing response (automatic in the pipeline)
+      - When cross-channel context needs to be prepended to the response
+      - When escalation acknowledgments need channel-appropriate formatting
+    inputs:
+      - name: body
+        type: string
+        description: Raw response message body
+      - name: channel
+        type: string
+        enum: [gmail, whatsapp, web-form]
+        description: Target delivery channel
+      - name: customer_name
+        type: string
+        description: Customer display name for greeting
+      - name: ticket_id
+        type: string
+        description: Ticket reference ID
+      - name: is_escalation
+        type: boolean
+        description: Whether this is an escalation acknowledgment
+      - name: sentiment
+        type: float
+        description: Customer sentiment score (drives empathy selection)
+    outputs:
+      - name: formatted_message
+        type: string
+        description: Channel-formatted response ready for delivery
+      - name: character_count
+        type: integer
+        description: Length of the formatted message
+    success_criteria:
+      - Gmail responses include formal greeting (Dear/Hi), body, and closing (Best regards)
+      - WhatsApp responses are under 300 characters with no mid-sentence truncation
+      - Web Form responses include ticket ID reference and semi-formal tone
+      - Negative sentiment triggers empathy opener ("I completely understand your frustration...")
+      - No duplicate empathy phrases in escalation + negative sentiment scenarios
+    implementation:
+      class: ResponseFormatter
+      file: src/agent/prototype.py
+      technique: >
+        Channel-specific templates with sentiment-driven empathy selection.
+        WhatsApp truncation uses sentence-boundary regex with negative
+        lookbehind for numbered lists. Gmail includes greeting, body
+        (up to 500 words), and professional closing. Web Form includes
+        ticket reference and structured layout.
+      channel_specs:
+        gmail:
+          tone: formal
+          max_length: ~500 words
+          greeting: "Dear {name}" or "Hi {name}"
+          closing: "Best regards, TaskFlow Support Team"
+        whatsapp:
+          tone: conversational
+          max_length: 300 characters
+          truncation: sentence-boundary with "Want me to explain more?" suffix
+          emoji: wave emoji for greetings
+        web_form:
+          tone: semi-formal
+          includes: ticket_id reference
+          structure: greeting + body + ticket reference + closing
+    mcp_tool: send_response
+    examples:
+      - input:
+          body: "You can set up recurring tasks by going to Task Settings..."
+          channel: whatsapp
+          customer_name: Alex
+          sentiment: 0.0
+        expected_behavior: >
+          Short, casual message under 300 chars. If truncated, ends at a
+          sentence boundary with "Want me to explain more?" appended.
+      - input:
+          body: "I understand your frustration. Let me connect you with our billing team..."
+          channel: gmail
+          customer_name: Sarah Chen
+          is_escalation: true
+          sentiment: -0.7
+        expected_behavior: >
+          Formal email with "Dear Sarah Chen," greeting, empathetic opener,
+          escalation details with SLA, "Best regards" closing.
+    performance_baseline:
+      whatsapp_truncation: "Clean truncation at sentence/list boundaries (fixed in v0.2)"
+      brand_voice_compliance: "Reasonable across all channels per brand-voice.md"
+      known_weakness: >
+        Duplicate empathy when escalation + negative sentiment combine.
+        WhatsApp escalation template ignores body parameter, so cross-channel
+        context is lost on WhatsApp escalation responses.
+
+  # ── Skill 5: Customer Identification ─────────────────────────────────
+  - name: customer_identification
+    description: >
+      Resolve customer identity across channels using email as the primary
+      identifier. Links alternative identifiers (phone numbers, secondary
+      emails) to a canonical customer ID. Enables cross-channel conversation
+      lookup and history retrieval.
+    when_to_use:
+      - When a new ticket arrives and the customer needs to be identified
+      - When a customer contacts via a different channel (email vs phone)
+      - When retrieving customer history across all past interactions
+      - When linking a WhatsApp phone number to an existing email-based profile
+    inputs:
+      - name: identifier
+        type: string
+        description: >
+          Customer identifier from the incoming message — email address
+          (gmail, web-form) or phone number (whatsapp)
+      - name: alt_id
+        type: string
+        optional: true
+        description: >
+          Alternative identifier to link (e.g., link phone to email).
+          Used during identity linking, not during resolution.
+    outputs:
+      - name: canonical_customer_id
+        type: string
+        description: >
+          The resolved primary email address for the customer. If no
+          match is found, returns the original identifier as-is.
+      - name: is_known_customer
+        type: boolean
+        description: Whether the customer has previous conversations on record
+    success_criteria:
+      - Email identifiers resolve to themselves (identity function)
+      - Phone numbers resolve to the linked email when a link exists
+      - Unknown identifiers are returned as-is (no error, new customer created)
+      - Identity linking is bidirectional (email→phone and phone→email)
+      - Case-insensitive matching (Alice@Email.com = alice@email.com)
+    implementation:
+      class: ConversationManager
+      file: src/agent/conversation_manager.py
+      technique: >
+        In-memory dict-based identity linking. _identity_links stores
+        bidirectional mappings (email ↔ phone). resolve_customer_id()
+        checks direct match in _customer_index first, then follows
+        _identity_links to find a canonical email.
+      storage: In-memory dict (Phase 3 will use PostgreSQL)
+    mcp_tool: get_customer_history
+    examples:
+      - input:
+          identifier: "alice@example.com"
+        expected_output:
+          canonical_customer_id: "alice@example.com"
+          is_known_customer: true
+      - input:
+          identifier: "+1-555-0123"
+        expected_behavior: >
+          If +1-555-0123 was previously linked to alice@example.com via
+          link_identity(), resolves to alice@example.com and returns her
+          full conversation history.
+    performance_baseline:
+      identity_resolution: "100% accurate for linked identities in tests"
+      known_weakness: >
+        No fuzzy matching — "alice@example.com" and "alice@example.co"
+        are treated as different customers. No phone number normalization.
+        Phase 3 will add fuzzy matching and E.164 phone normalization.
+
+  # ── Skill 6: Conversation Continuity ─────────────────────────────────
+  - name: conversation_continuity
+    description: >
+      Track multi-turn conversations per customer across channels, maintain
+      message history, detect sentiment trends, enable cross-channel
+      context references, and trigger auto-escalation when sentiment
+      declines persistently.
+    when_to_use:
+      - Every incoming message (to find or create the active conversation)
+      - When a customer switches channels mid-conversation (email → WhatsApp)
+      - When checking if sentiment is trending negative over multiple messages
+      - When generating responses that reference prior interactions
+    inputs:
+      - name: customer_id
+        type: string
+        description: Canonical customer ID (resolved via customer_identification)
+      - name: channel
+        type: string
+        description: Current message channel
+      - name: message
+        type: string
+        description: Current message content
+      - name: sentiment
+        type: float
+        description: Sentiment score for the current message
+      - name: intent
+        type: string
+        description: Detected intent for topic tracking
+    outputs:
+      - name: conversation
+        type: Conversation
+        description: >
+          The active (or newly created) conversation object with full
+          message history, topics discussed, channels used, and
+          sentiment history.
+      - name: cross_channel_context
+        type: string
+        optional: true
+        description: >
+          Context string like "I see you contacted us earlier via gmail
+          about integration issue. Let me help you further." — only
+          present when messages exist from a different channel.
+      - name: sentiment_trend
+        type: dict
+        description: >
+          Trend analysis with should_escalate (bool), reason (string),
+          trend (declining/improving/stable/insufficient_data), and
+          consecutive_negative count.
+    success_criteria:
+      - Same customer on same channel reuses existing active conversation
+      - Same customer on different channel reuses conversation AND tracks channel switch
+      - Resolved conversations are not reused (new conversation created)
+      - Escalated conversations ARE reused for follow-up messages
+      - 3+ consecutive negative messages (< -0.2) triggers auto-escalation
+      - Sentiment drop > 0.4 from first to current message triggers auto-escalation
+      - Topics from intent detection are tracked and deduplicated
+    implementation:
+      class: ConversationManager
+      file: src/agent/conversation_manager.py
+      technique: >
+        In-memory conversation store with _conversations dict (conv_id →
+        Conversation), _customer_index dict (customer_id → list of conv_ids),
+        and _identity_links for cross-channel resolution.
+        get_or_create_conversation() reuses active/escalated conversations.
+        check_sentiment_trend() analyzes sentiment_history for consecutive
+        negative messages and significant drops.
+      state_machine: "active → resolved | escalated (escalated reused for follow-ups)"
+      sentiment_thresholds:
+        negative_cutoff: -0.2
+        consecutive_limit: 3
+        drop_threshold: -0.4
+    mcp_tool: get_customer_history
+    examples:
+      - scenario: "Customer emails about Slack integration, then WhatsApps a follow-up"
+        expected_behavior: >
+          First message creates conversation on gmail channel. Second
+          message on WhatsApp finds the same conversation via customer ID
+          resolution, adds "whatsapp" to channels_used, and generates
+          cross-channel context: "I see you contacted us earlier via gmail
+          about integration issue."
+      - scenario: "Customer sends 4 increasingly frustrated messages"
+        expected_behavior: >
+          Sentiment tracked as [+0.5, +0.1, -0.3, -0.8]. After message 4,
+          check_sentiment_trend() detects drop > 0.4 from first (+0.5) to
+          current (-0.8) and returns should_escalate: true.
+    performance_baseline:
+      test_coverage: "61/61 tests passing across 6 test groups"
+      cross_channel_accuracy: "100% in test scenarios"
+      known_weakness: >
+        In-memory storage means all state is lost on restart. WhatsApp
+        escalation template suppresses cross-channel context due to
+        300-char limit. Keyword sentiment gives extreme scores, making
+        the consecutive-negative threshold easy to trigger.
+
+# ─────────────────────────────────────────────────────────────────────────
+channels:
+  - name: gmail
+    protocol: Gmail API / IMAP
+    format: structured_email
+    constraints:
+      max_length: ~500 words
+      tone: formal
+      requires: greeting, closing, ticket reference
+
+  - name: whatsapp
+    protocol: WhatsApp Business API
+    format: chat_message
+    constraints:
+      max_length: 300 characters
+      tone: conversational
+      truncation: sentence-boundary aware
+
+  - name: web_form
+    protocol: HTTP POST
+    format: form_submission
+    constraints:
+      tone: semi-formal
+      requires: ticket_id reference
+
+# ─────────────────────────────────────────────────────────────────────────
+escalation_routing:
+  billing:
+    contact: Lisa Tanaka
+    email: billing@techcorp.io
+    tier: 1
+  legal:
+    contact: Rachel Foster
+    email: legal@techcorp.io
+    tier: 1
+  security:
+    contact: James Okafor
+    email: security@techcorp.io
+    tier: 1
+  account:
+    contact: Sarah Chen
+    email: cs-lead@techcorp.io
+    tier: 1
+  technical:
+    contact: Priya Patel
+    email: engineering-support@techcorp.io
+    tier: 1
+  churn:
+    contact: Marcus Rivera
+    email: cs-lead@techcorp.io
+    tier: 1
+  general:
+    contact: Marcus Rivera
+    email: cs-lead@techcorp.io
+    tier: 1
+
+sla_by_plan:
+  enterprise: 1 hour
+  pro: 4 hours
+  free: 24 hours

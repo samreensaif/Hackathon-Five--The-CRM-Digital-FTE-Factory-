@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fte-metrics-collector
+  namespace: customer-success-fte
+  labels:
+    app: customer-success-fte
+    component: metrics-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: customer-success-fte
+      component: metrics-collector
+  template:
+    metadata:
+      labels:
+        app: customer-success-fte
+        component: metrics-collector
+    spec:
+      containers:
+        - name: fte-metrics-collector
+          image: your-registry/customer-success-fte:latest
+          command: ["python", "workers/metrics_collector.py"]
+          envFrom:
+            - configMapRef:
+                name: fte-config
+            - secretRef:
+                name: fte-secrets
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "250m"
+      restartPolicy: Always

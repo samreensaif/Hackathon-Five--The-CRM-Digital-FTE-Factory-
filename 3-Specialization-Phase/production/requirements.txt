@@ -1,0 +1,32 @@
+# Customer Success Digital FTE — Production Dependencies
+# =====================================================
+
+# ── Web Framework ────────────────────────────────────
+fastapi>=0.115.0
+uvicorn>=0.34.0
+pydantic[email]>=2.10.0
+python-multipart>=0.0.12
+aiofiles>=24.1.0
+
+# ── AI / Agent ───────────────────────────────────────
+openai>=1.60.0
+openai-agents>=0.1.0
+
+# ── Database ─────────────────────────────────────────
+asyncpg>=0.30.0
+pgvector>=0.3.0
+
+# ── Event Streaming ──────────────────────────────────
+aiokafka>=0.11.0
+
+# ── Gmail Integration ────────────────────────────────
+google-auth>=2.36.0
+google-auth-oauthlib>=1.2.0
+google-api-python-client>=2.160.0
+
+# ── WhatsApp / Twilio ────────────────────────────────
+twilio>=9.0.0
+httpx>=0.28.0
+
+# ── Utilities ────────────────────────────────────────
+python-dotenv>=1.0.0

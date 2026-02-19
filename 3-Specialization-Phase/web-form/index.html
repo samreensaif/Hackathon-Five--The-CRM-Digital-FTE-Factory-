@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TaskFlow Support — Customer Success Digital FTE</title>
+
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- React 18 -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+
+  <!-- Babel for JSX transpilation -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <style>
+    body {
+      background-color: #f3f4f6;
+    }
+  </style>
+</head>
+<body class="min-h-screen flex items-center justify-center p-4">
+  <div id="root"></div>
+
+  <script type="text/babel" data-type="module">
+    const { useState, useCallback } = React;
+
+    const API_URL = "http://localhost:8000/support/submit";
+
+    // ── Validation ──────────────────────────────────────────────────────────
+
+    const validators = {
+      name: (v) => {
+        if (!v || v.trim().length < 2) return "Name must be at least 2 characters";
+        return null;
+      },
+      email: (v) => {
+        if (!v) return "Email is required";
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)) return "Please enter a valid email address";
+        return null;
+      },
+      subject: (v) => {
+        if (!v || v.trim().length < 5) return "Subject must be at least 5 characters";
+        return null;
+      },
+      category: (v) => {
+        if (!v) return "Please select a category";
+        return null;
+      },
+      priority: (v) => {
+        if (!v) return "Please select a priority";
+        return null;
+      },
+      message: (v) => {
+        if (!v || v.trim().length < 10) return "Message must be at least 10 characters";
+        return null;
+      },
+    };
+
+    function validateAll(form) {
+      const errors = {};
+      for (const [field, fn] of Object.entries(validators)) {
+        const err = fn(form[field]);
+        if (err) errors[field] = err;
+      }
+      return errors;
+    }
+
+    // ── Category & Priority Options ─────────────────────────────────────────
+
+    const CATEGORIES = [
+      { value: "", label: "Select a category..." },
+      { value: "general", label: "General Question" },
+      { value: "technical", label: "Technical Support" },
+      { value: "billing", label: "Billing Inquiry" },
+      { value: "bug_report", label: "Bug Report" },
+      { value: "feedback", label: "Feedback" },
+    ];
+
+    const PRIORITIES = [
+      { value: "", label: "Select priority..." },
+      { value: "low", label: "Low \u2014 Not urgent" },
+      { value: "medium", label: "Medium \u2014 Need help soon" },
+      { value: "high", label: "High \u2014 Urgent issue" },
+    ];
+
+    // ── Icons ───────────────────────────────────────────────────────────────
+
+    function CheckCircleIcon() {
+      return (
+        <svg className="w-16 h-16 text-green-500 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+        </svg>
+      );
+    }
+
+    function SpinnerIcon() {
+      return (
+        <svg className="animate-spin h-5 w-5 text-white inline-block mr-2" fill="none" viewBox="0 0 24 24">
+          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+        </svg>
+      );
+    }
+
+    // ── Form Field Component ────────────────────────────────────────────────
+
+    function FormField({ label, error, required, children }) {
+      return (
+        <div className="mb-5">
+          <label className="block text-sm font-medium text-gray-700 mb-1.5">
+            {label}
+            {required && <span className="text-red-500 ml-0.5">*</span>}
+          </label>
+          {children}
+          {error && (
+            <p className="mt-1 text-sm text-red-600 flex items-center gap-1">
+              <svg className="w-4 h-4 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
+                <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+              </svg>
+              {error}
+            </p>
+          )}
+        </div>
+      );
+    }
+
+    // ── Success Screen ──────────────────────────────────────────────────────
+
+    function SuccessScreen({ ticketId, onReset }) {
+      return (
+        <div className="text-center py-8 px-4">
+          <CheckCircleIcon />
+          <h2 className="mt-4 text-2xl font-bold text-gray-900">
+            Thank you!
+          </h2>
+          <p className="mt-2 text-gray-600">
+            Your request has been submitted successfully.
+          </p>
+
+          <div className="mt-6 bg-blue-50 border border-blue-200 rounded-lg p-4 inline-block">
+            <p className="text-sm text-blue-600 font-medium">Your Ticket ID</p>
+            <p className="text-2xl font-mono font-bold text-blue-800 mt-1">{ticketId}</p>
+          </div>
+
+          <p className="mt-6 text-gray-600">
+            Our AI assistant will respond{" "}
+            <span className="font-semibold">within 5 minutes</span>.
+            <br />
+            You'll receive a reply at the email address you provided.
+          </p>
+
+          <button
+            onClick={onReset}
+            className="mt-8 px-6 py-2.5 bg-blue-600 text-white font-medium rounded-lg hover:bg-blue-700 transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2"
+          >
+            Submit Another Request
+          </button>
+        </div>
+      );
+    }
+
+    // ── Main Form Component ─────────────────────────────────────────────────
+
+    function SupportForm() {
+      const initialForm = {
+        name: "",
+        email: "",
+        subject: "",
+        category: "",
+        priority: "medium",
+        message: "",
+      };
+
+      const [form, setForm] = useState(initialForm);
+      const [errors, setErrors] = useState({});
+      const [touched, setTouched] = useState({});
+      const [submitting, setSubmitting] = useState(false);
+      const [submitError, setSubmitError] = useState(null);
+      const [ticketId, setTicketId] = useState(null);
+
+      const handleChange = useCallback((e) => {
+        const { name, value } = e.target;
+        setForm((prev) => ({ ...prev, [name]: value }));
+
+        setErrors((prev) => {
+          const err = validators[name]?.(value);
+          if (!err) {
+            const next = { ...prev };
+            delete next[name];
+            return next;
+          }
+          return prev;
+        });
+      }, []);
+
+      const handleBlur = useCallback((e) => {
+        const { name, value } = e.target;
+        setTouched((prev) => ({ ...prev, [name]: true }));
+
+        const err = validators[name]?.(value);
+        if (err) {
+          setErrors((prev) => ({ ...prev, [name]: err }));
+        } else {
+          setErrors((prev) => {
+            const next = { ...prev };
+            delete next[name];
+            return next;
+          });
+        }
+      }, []);
+
+      const handleSubmit = useCallback(
+        async (e) => {
+          e.preventDefault();
+          setSubmitError(null);
+
+          const allErrors = validateAll(form);
+          setErrors(allErrors);
+          setTouched({ name: true, email: true, subject: true, category: true, priority: true, message: true });
+
+          if (Object.keys(allErrors).length > 0) return;
+
+          setSubmitting(true);
+
+          try {
+            const res = await fetch(API_URL, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                name: form.name.trim(),
+                email: form.email.trim(),
+                subject: form.subject.trim(),
+                category: form.category,
+                priority: form.priority,
+                message: form.message.trim(),
+              }),
+            });
+
+            if (!res.ok) {
+              const data = await res.json().catch(() => ({}));
+              throw new Error(data.detail || `Request failed (${res.status})`);
+            }
+
+            const data = await res.json();
+            setTicketId(data.ticket_id);
+          } catch (err) {
+            setSubmitError(err.message || "Something went wrong. Please try again.");
+          } finally {
+            setSubmitting(false);
+          }
+        },
+        [form]
+      );
+
+      const handleReset = useCallback(() => {
+        setForm(initialForm);
+        setErrors({});
+        setTouched({});
+        setSubmitError(null);
+        setTicketId(null);
+      }, []);
+
+      const inputClass = (field) =>
+        `w-full px-3.5 py-2.5 border rounded-lg text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-colors ${
+          touched[field] && errors[field]
+            ? "border-red-300 bg-red-50"
+            : "border-gray-300 bg-white hover:border-gray-400"
+        }`;
+
+      // ── Success State ─────────────────────────────────────────────────
+      if (ticketId) {
+        return (
+          <div className="max-w-lg mx-auto">
+            <div className="bg-white rounded-2xl shadow-lg border border-gray-100 overflow-hidden">
+              <div className="bg-gradient-to-r from-blue-600 to-blue-700 px-6 py-4">
+                <h1 className="text-white text-lg font-semibold">TaskFlow Support</h1>
+              </div>
+              <SuccessScreen ticketId={ticketId} onReset={handleReset} />
+            </div>
+          </div>
+        );
+      }
+
+      // ── Form State ────────────────────────────────────────────────────
+      return (
+        <div className="max-w-lg mx-auto">
+          <div className="bg-white rounded-2xl shadow-lg border border-gray-100 overflow-hidden">
+            {/* Header */}
+            <div className="bg-gradient-to-r from-blue-600 to-blue-700 px-6 py-5">
+              <h1 className="text-white text-xl font-bold">TaskFlow Support</h1>
+              <p className="text-blue-100 text-sm mt-1">
+                How can we help? Our AI assistant typically responds within 5 minutes.
+              </p>
+            </div>
+
+            {/* Form */}
+            <form onSubmit={handleSubmit} noValidate className="px-6 py-6">
+              {submitError && (
+                <div className="mb-5 p-3.5 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
+                  {submitError}
+                </div>
+              )}
+
+              <FormField label="Your Name" error={touched.name && errors.name} required>
+                <input
+                  type="text"
+                  name="name"
+                  value={form.name}
+                  onChange={handleChange}
+                  onBlur={handleBlur}
+                  placeholder="Jane Smith"
+                  className={inputClass("name")}
+                  disabled={submitting}
+                />
+              </FormField>
+
+              <FormField label="Email Address" error={touched.email && errors.email} required>
+                <input
+                  type="email"
+                  name="email"
+                  value={form.email}
+                  onChange={handleChange}
+                  onBlur={handleBlur}
+                  placeholder="jane@company.com"
+                  className={inputClass("email")}
+                  disabled={submitting}
+                />
+              </FormField>
+
+              <FormField label="Subject" error={touched.subject && errors.subject} required>
+                <input
+                  type="text"
+                  name="subject"
+                  value={form.subject}
+                  onChange={handleChange}
+                  onBlur={handleBlur}
+                  placeholder="Brief description of your issue"
+                  className={inputClass("subject")}
+                  disabled={submitting}
+                />
+              </FormField>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <FormField label="Category" error={touched.category && errors.category} required>
+                  <select
+                    name="category"
+                    value={form.category}
+                    onChange={handleChange}
+                    onBlur={handleBlur}
+                    className={inputClass("category")}
+                    disabled={submitting}
+                  >
+                    {CATEGORIES.map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                </FormField>
+
+                <FormField label="Priority" error={touched.priority && errors.priority} required>
+                  <select
+                    name="priority"
+                    value={form.priority}
+                    onChange={handleChange}
+                    onBlur={handleBlur}
+                    className={inputClass("priority")}
+                    disabled={submitting}
+                  >
+                    {PRIORITIES.map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                </FormField>
+              </div>
+
+              <FormField label="Message" error={touched.message && errors.message} required>
+                <textarea
+                  name="message"
+                  value={form.message}
+                  onChange={handleChange}
+                  onBlur={handleBlur}
+                  placeholder="Please describe your issue in detail..."
+                  rows={5}
+                  maxLength={5000}
+                  className={`${inputClass("message")} resize-y min-h-[120px]`}
+                  disabled={submitting}
+                />
+                <div className="mt-1 text-xs text-gray-400 text-right">
+                  {form.message.length} / 5,000 characters
+                </div>
+              </FormField>
+
+              <button
+                type="submit"
+                disabled={submitting}
+                className="w-full py-3 px-4 bg-blue-600 text-white font-semibold rounded-lg hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2"
+              >
+                {submitting ? (
+                  <>
+                    <SpinnerIcon />
+                    Submitting...
+                  </>
+                ) : (
+                  "Submit Support Request"
+                )}
+              </button>
+
+              <p className="mt-4 text-center text-xs text-gray-400">
+                By submitting, you agree to TechCorp's terms of service.
+                <br />
+                Powered by Customer Success Digital FTE
+              </p>
+            </form>
+          </div>
+        </div>
+      );
+    }
+
+    // ── Mount ──────────────────────────────────────────────────────────────
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<SupportForm />);
+  </script>
+</body>
+</html>

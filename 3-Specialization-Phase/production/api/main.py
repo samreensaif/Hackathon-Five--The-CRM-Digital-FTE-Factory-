@@ -1,0 +1,561 @@
+"""
+Customer Success Digital FTE — FastAPI Application
+====================================================
+Main application entry point with lifecycle management, webhook endpoints,
+and monitoring routes.
+
+Startup:
+  1. Connect to PostgreSQL (asyncpg pool)
+  2. Start Kafka producer
+  3. Register channel routers
+
+Shutdown:
+  1. Close PostgreSQL pool
+  2. Stop Kafka producer
+
+Run:
+  uvicorn api.main:app --host 0.0.0.0 --port 8000
+
+Environment:
+  DATABASE_URL — PostgreSQL connection string
+  KAFKA_BOOTSTRAP_SERVERS — Kafka broker list
+  CORS_ORIGINS — Comma-separated allowed origins
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import os
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Optional
+
+import asyncpg
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+from agent.tools import set_db_pool
+from channels.web_form_handler import router as web_form_router
+from kafka_client import (
+    TOPICS,
+    get_producer,
+    init_producer,
+    shutdown_producer,
+)
+
+logger = logging.getLogger("api")
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+)
+
+# ── Configuration ────────────────────────────────────────────────────────
+
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://{user}:{password}@{host}:{port}/{db}".format(
+        user=os.environ.get("POSTGRES_USER", "fte"),
+        password=os.environ.get("POSTGRES_PASSWORD", "fte_secret"),
+        host=os.environ.get("POSTGRES_HOST", "localhost"),
+        port=os.environ.get("POSTGRES_PORT", "5432"),
+        db=os.environ.get("POSTGRES_DB", "fte_production"),
+    ),
+)
+
+CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(",")
+
+
+# ── Lifespan ────────────────────────────────────────────────────────────
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifecycle: startup and shutdown."""
+    # ── Startup ──────────────────────────────────────────────────────
+    logger.info("Starting Customer Success Digital FTE API...")
+
+    # 1. Connect to PostgreSQL
+    try:
+        pool = await asyncpg.create_pool(
+            DATABASE_URL,
+            min_size=2,
+            max_size=10,
+            command_timeout=30,
+        )
+        app.state.db_pool = pool
+        set_db_pool(pool)
+        logger.info("PostgreSQL pool connected")
+    except Exception as e:
+        logger.error(f"Failed to connect to PostgreSQL: {e}")
+        raise
+
+    # 2. Start Kafka producer
+    try:
+        await init_producer()
+        logger.info("Kafka producer started")
+    except Exception as e:
+        logger.warning(f"Kafka producer failed to start (non-fatal): {e}")
+
+    logger.info("API startup complete")
+    yield
+
+    # ── Shutdown ─────────────────────────────────────────────────────
+    logger.info("Shutting down API...")
+
+    try:
+        await shutdown_producer()
+        logger.info("Kafka producer stopped")
+    except Exception as e:
+        logger.warning(f"Error stopping Kafka producer: {e}")
+
+    try:
+        pool = app.state.db_pool
+        if pool:
+            await pool.close()
+            logger.info("PostgreSQL pool closed")
+    except Exception as e:
+        logger.warning(f"Error closing PostgreSQL pool: {e}")
+
+
+# ── App ──────────────────────────────────────────────────────────────────
+
+app = FastAPI(
+    title="Customer Success Digital FTE",
+    description="24/7 AI customer support agent for TaskFlow by TechCorp",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Include channel routers
+app.include_router(web_form_router)
+
+
+# ── Health Checks ────────────────────────────────────────────────────────
+
+
+@app.get("/health", tags=["health"])
+async def health_check():
+    """Kubernetes liveness probe — lightweight check."""
+    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get("/health/detailed", tags=["health"])
+async def health_check_detailed(request: Request):
+    """Detailed health check — validates DB, Kafka, and channel status."""
+    checks = {}
+
+    # Database check
+    try:
+        pool = request.app.state.db_pool
+        async with pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        checks["database"] = {"status": "healthy"}
+    except Exception as e:
+        checks["database"] = {"status": "unhealthy", "error": str(e)}
+
+    # Kafka check
+    try:
+        producer = get_producer()
+        if producer and producer._producer:
+            checks["kafka"] = {"status": "healthy"}
+        else:
+            checks["kafka"] = {"status": "unavailable", "error": "Producer not started"}
+    except Exception as e:
+        checks["kafka"] = {"status": "unhealthy", "error": str(e)}
+
+    # Channel status
+    channels = {}
+    try:
+        from database.queries import get_all_channel_configs
+
+        pool = request.app.state.db_pool
+        configs = await get_all_channel_configs(pool)
+        for cfg in configs:
+            channels[cfg["channel"]] = {"enabled": cfg.get("enabled", False)}
+    except Exception:
+        channels = {"error": "Could not load channel configs"}
+    checks["channels"] = channels
+
+    overall = "healthy" if all(
+        c.get("status") == "healthy"
+        for c in [checks["database"], checks["kafka"]]
+    ) else "degraded"
+
+    return {"status": overall, "checks": checks}
+
+
+# ── Gmail Webhook ────────────────────────────────────────────────────────
+
+
+@app.post("/webhooks/gmail", tags=["webhooks"])
+async def gmail_webhook(request: Request):
+    """Receive Gmail Pub/Sub push notifications.
+
+    Google Cloud Pub/Sub sends POST requests when new emails arrive.
+    We decode the notification, fetch new messages, and publish to Kafka.
+    """
+    try:
+        body = await request.json()
+        message = body.get("message", {})
+        data = message.get("data", "")
+
+        if not data:
+            return JSONResponse({"status": "no_data"}, status_code=200)
+
+        # Decode base64-encoded Pub/Sub message
+        decoded = base64.b64decode(data).decode("utf-8")
+        pubsub_message = json.loads(decoded)
+
+        logger.info(f"Gmail Pub/Sub notification: {pubsub_message.get('emailAddress')}")
+
+        # Process notification to get normalized messages
+        from channels.gmail_handler import process_notification
+
+        messages = await process_notification(pubsub_message)
+
+        # Publish each new message to Kafka
+        producer = get_producer()
+        published = 0
+        for msg in messages:
+            try:
+                if producer:
+                    await producer.publish(
+                        TOPICS["email_inbound"],
+                        msg,
+                        key=msg.get("customer_email", ""),
+                    )
+                    # Also publish to unified incoming topic
+                    await producer.publish_ticket(msg)
+                    published += 1
+            except Exception as e:
+                logger.error(f"Failed to publish email to Kafka: {e}")
+
+        return JSONResponse({
+            "status": "ok",
+            "messages_processed": len(messages),
+            "messages_published": published,
+        })
+
+    except Exception as e:
+        logger.error(f"Gmail webhook error: {e}", exc_info=True)
+        # Return 200 to prevent Pub/Sub retries on application errors
+        return JSONResponse({"status": "error", "detail": str(e)}, status_code=200)
+
+
+# ── WhatsApp Webhooks ────────────────────────────────────────────────────
+
+
+@app.post("/webhooks/whatsapp", tags=["webhooks"])
+async def whatsapp_webhook(request: Request):
+    """Receive incoming WhatsApp messages via Twilio webhook.
+
+    Validates the Twilio signature, processes the message, publishes
+    to Kafka, and returns TwiML response.
+    """
+    try:
+        form_data = dict(await request.form())
+        logger.info(f"WhatsApp webhook received: From={form_data.get('From')}, Body={str(form_data.get('Body', ''))[:80]}")
+
+        # Validate Twilio signature (skip in development — ngrok breaks signatures)
+        from channels.whatsapp_handler import (
+            TWILIO_WEBHOOK_URL,
+            process_webhook,
+            validate_webhook,
+        )
+
+        if os.getenv("ENVIRONMENT", "development") == "production":
+            signature = request.headers.get("X-Twilio-Signature", "")
+            webhook_url = TWILIO_WEBHOOK_URL or str(request.url)
+
+            if not validate_webhook(signature, webhook_url, form_data):
+                logger.warning("Invalid Twilio webhook signature")
+                raise HTTPException(status_code=403, detail="Invalid signature")
+        else:
+            logger.debug("Skipping Twilio signature validation (ENVIRONMENT != production)")
+
+        # Process the incoming message
+        normalized = await process_webhook(form_data)
+
+        if not normalized:
+            logger.warning("WhatsApp webhook: process_webhook returned None, skipping")
+            twiml = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
+            return Response(content=twiml, media_type="application/xml")
+
+        logger.info(
+            f"WhatsApp message normalized: phone={normalized.get('customer_phone')}, "
+            f"content_length={len(normalized.get('content', ''))}"
+        )
+
+        # Get or re-initialize the Kafka producer
+        producer = get_producer()
+        if not producer:
+            logger.warning("Kafka producer is None — attempting to re-initialize")
+            try:
+                producer = await init_producer()
+                logger.info("Kafka producer re-initialized successfully")
+            except Exception as e:
+                logger.error(f"Kafka producer re-init failed: {e}")
+
+        if producer:
+            try:
+                logger.info(f"Publishing to Kafka topic: {TOPICS['whatsapp_inbound']}")
+                await producer.publish(
+                    TOPICS["whatsapp_inbound"],
+                    normalized,
+                    key=normalized.get("customer_phone", ""),
+                )
+                logger.info(f"Publishing to Kafka topic: {TOPICS['tickets_incoming']}")
+                await producer.publish_ticket(normalized)
+                logger.info("WhatsApp message published to Kafka successfully")
+            except Exception as e:
+                logger.error(f"Failed to publish WhatsApp message to Kafka: {e}", exc_info=True)
+        else:
+            logger.error(
+                "CRITICAL: Kafka producer unavailable — WhatsApp message DROPPED: "
+                f"phone={normalized.get('customer_phone')}"
+            )
+
+        # Return TwiML response (empty — agent responds async via Twilio API)
+        twiml = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
+        return Response(content=twiml, media_type="application/xml")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"WhatsApp webhook error: {e}", exc_info=True)
+        twiml = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
+        return Response(content=twiml, media_type="application/xml")
+
+
+@app.post("/webhooks/whatsapp/status", tags=["webhooks"])
+async def whatsapp_status_webhook(request: Request):
+    """Receive WhatsApp delivery status updates from Twilio."""
+    try:
+        form_data = dict(await request.form())
+
+        from channels.whatsapp_handler import process_status_callback
+
+        status = await process_status_callback(form_data)
+
+        # Update message delivery status in DB
+        if status.get("channel_message_id"):
+            try:
+                from database.queries import _execute
+
+                pool = request.app.state.db_pool
+                await _execute(
+                    pool,
+                    """
+                    UPDATE messages
+                    SET delivery_status = $2
+                    WHERE channel_message_id = $1
+                    """,
+                    status["channel_message_id"],
+                    status.get("delivery_status", "unknown"),
+                )
+            except Exception as e:
+                logger.warning(f"Failed to update delivery status: {e}")
+
+        return JSONResponse({"status": "ok"})
+
+    except Exception as e:
+        logger.error(f"WhatsApp status webhook error: {e}", exc_info=True)
+        return JSONResponse({"status": "error"}, status_code=200)
+
+
+# ── Metrics ──────────────────────────────────────────────────────────────
+
+
+@app.get("/metrics/channels", tags=["metrics"])
+async def get_channel_metrics(
+    request: Request,
+    hours: int = 24,
+    channel: Optional[str] = None,
+):
+    """Get aggregated metrics per channel.
+
+    Returns response latency, escalation rate, sentiment, and ticket
+    counts for each channel over the specified time window.
+    """
+    try:
+        from database.queries import get_metrics_summary
+
+        pool = request.app.state.db_pool
+        channels = ["email", "whatsapp", "web_form"] if not channel else [channel]
+
+        metrics = {}
+        for ch in channels:
+            latency = await get_metrics_summary(pool, "response_latency_ms", hours, ch)
+            escalation = await get_metrics_summary(pool, "escalation_rate", hours, ch)
+            sentiment = await get_metrics_summary(pool, "sentiment_score", hours, ch)
+
+            metrics[ch] = {
+                "latency": latency,
+                "escalation_rate": escalation,
+                "sentiment": sentiment,
+            }
+
+        return {
+            "window_hours": hours,
+            "channels": metrics,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to fetch metrics: {e}", exc_info=True)
+        raise HTTPException(status_code=503, detail="Metrics unavailable")
+
+
+# ── Conversations ────────────────────────────────────────────────────────
+
+
+@app.get("/conversations/{conversation_id}", tags=["conversations"])
+async def get_conversation(request: Request, conversation_id: str):
+    """Get conversation history by ID."""
+    try:
+        conv_uuid = uuid.UUID(conversation_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid conversation ID format")
+
+    try:
+        from database.queries import get_conversation_history
+
+        pool = request.app.state.db_pool
+        messages = await get_conversation_history(pool, conv_uuid)
+
+        if not messages:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        return {
+            "conversation_id": conversation_id,
+            "message_count": len(messages),
+            "messages": [
+                {
+                    "id": str(m["id"]),
+                    "role": m.get("role", ""),
+                    "content": m.get("content", ""),
+                    "channel": m.get("channel", ""),
+                    "direction": m.get("direction", ""),
+                    "sentiment_score": float(m["sentiment_score"])
+                    if m.get("sentiment_score") is not None
+                    else None,
+                    "created_at": m["created_at"].isoformat()
+                    if hasattr(m.get("created_at"), "isoformat")
+                    else str(m.get("created_at", "")),
+                }
+                for m in messages
+            ],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to fetch conversation: {e}", exc_info=True)
+        raise HTTPException(status_code=503, detail="Unable to retrieve conversation")
+
+
+# ── Customer Lookup ──────────────────────────────────────────────────────
+
+
+@app.get("/customers/lookup", tags=["customers"])
+async def lookup_customer(request: Request, email: Optional[str] = None):
+    """Look up a customer by email address."""
+    if not email:
+        raise HTTPException(status_code=400, detail="Email parameter required")
+
+    try:
+        from database.queries import get_or_create_customer
+
+        pool = request.app.state.db_pool
+        customer = await get_or_create_customer(pool, email=email)
+
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+
+        return {
+            "id": str(customer["id"]),
+            "email": customer.get("email"),
+            "name": customer.get("name"),
+            "plan": customer.get("plan"),
+            "phone": customer.get("phone"),
+            "created_at": customer["created_at"].isoformat()
+            if hasattr(customer.get("created_at"), "isoformat")
+            else str(customer.get("created_at", "")),
+            "last_contact_at": customer["last_contact_at"].isoformat()
+            if hasattr(customer.get("last_contact_at"), "isoformat")
+            else None,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Customer lookup failed: {e}", exc_info=True)
+        raise HTTPException(status_code=503, detail="Customer lookup unavailable")
+
+
+# ── Test / Debug Endpoints ───────────────────────────────────────────────
+
+
+@app.post("/test/kafka", tags=["debug"])
+async def test_kafka_publish(message: str = "test"):
+    """Publish a test message to Kafka to verify the pipeline is working."""
+    producer = get_producer()
+    if not producer:
+        try:
+            producer = await init_producer()
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Kafka producer unavailable: {e}")
+
+    topic = TOPICS["tickets_incoming"]
+    test_event = {
+        "channel": "whatsapp",
+        "customer_phone": "+923360840000",
+        "customer_name": "Test User",
+        "content": message,
+        "subject": "Test Message",
+        "received_at": datetime.now(timezone.utc).isoformat(),
+        "channel_message_id": f"test-{uuid.uuid4().hex[:8]}",
+    }
+
+    try:
+        await producer.publish(topic, test_event, key=test_event["customer_phone"])
+        logger.info(f"Test message published to {topic}: {test_event['channel_message_id']}")
+        return {
+            "status": "published",
+            "topic": topic,
+            "event_id": test_event.get("event_id"),
+            "channel_message_id": test_event["channel_message_id"],
+        }
+    except Exception as e:
+        logger.error(f"Test publish failed: {e}", exc_info=True)
+        raise HTTPException(status_code=503, detail=f"Kafka publish failed: {e}")
+
+
+# ── Global Error Handler ─────────────────────────────────────────────────
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Catch-all error handler to prevent unhandled 500 errors."""
+    logger.error(f"Unhandled error on {request.method} {request.url}: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "An internal error occurred. Please try again later.",
+            "request_id": str(uuid.uuid4()),
+        },
+    )
