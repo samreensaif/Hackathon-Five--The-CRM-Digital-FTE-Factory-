@@ -89,12 +89,45 @@ as **Secret Files** at `/etc/secrets/gmail_credentials.json` and
 
 ### 4. Initialize the Database
 
-After the first deploy, run the schema against the Render database:
+After the first deploy, open the **Render Shell** for `fte-api`
+(Dashboard → fte-api → Shell) and run:
 
 ```bash
-# Get the connection string from Render Dashboard → fte-postgres → Connection
+python database/init_db.py
+```
+
+Expected output:
+
+```
+Connecting to PostgreSQL at <host>/<db> ...
+Connected.
+Enabling pgvector extension ...
+  pgvector: OK
+Applying schema.sql ...
+  schema.sql: executed successfully
+Verifying tables ...
+  agent_metrics: OK
+  channel_configs: OK
+  conversations: OK
+  customer_identifiers: OK
+  customers: OK
+  knowledge_base: OK
+  message_queue: OK
+  messages: OK
+  tickets: OK
+
+Database initialised successfully — 9 tables ready.
+Connection closed.
+```
+
+The script is safe to re-run at any time — every statement in schema.sql
+uses `IF NOT EXISTS` so existing data is never affected.
+
+**Alternative (psql from local machine):**
+```bash
+# Get DATABASE_URL from Render Dashboard → fte-postgres → Connection
 psql "$DATABASE_URL" -c "CREATE EXTENSION IF NOT EXISTS vector;"
-psql "$DATABASE_URL" < database/schema.sql
+psql "$DATABASE_URL" < 4-Render-Deploy/database/schema.sql
 ```
 
 ### 5. Load the Knowledge Base (optional)
