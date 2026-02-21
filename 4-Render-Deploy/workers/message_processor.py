@@ -489,7 +489,7 @@ class UnifiedMessageProcessor:
 
 
 async def main():
-    """Run the message processor worker."""
+    """Run the message processor worker — stays alive until SIGTERM/SIGINT."""
     processor = UnifiedMessageProcessor()
 
     # Handle graceful shutdown signals
@@ -531,20 +531,29 @@ async def main():
             await asyncio.sleep(delay)
 
     try:
-        # Run poll loop in background, wait for shutdown signal
+        # Start the poll loop as a background task
         consumer_task = asyncio.create_task(processor.run())
 
-        done, pending = await asyncio.wait(
-            [consumer_task, asyncio.create_task(shutdown_event.wait())],
-            return_when=asyncio.FIRST_COMPLETED,
-        )
+        # Keep main() alive until a shutdown signal arrives.
+        # Also watch for the consumer task dying unexpectedly and restart it
+        # so a transient error never causes the whole worker to exit.
+        while not shutdown_event.is_set():
+            if consumer_task.done():
+                exc = consumer_task.exception() if not consumer_task.cancelled() else None
+                if exc:
+                    logger.error(f"Consumer task died unexpectedly: {exc} — restarting")
+                else:
+                    logger.warning("Consumer task exited without error — restarting")
+                consumer_task = asyncio.create_task(processor.run())
+            await asyncio.sleep(1)
 
-        for task in pending:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        # Shutdown requested — stop the poll loop and wait for it to finish
+        logger.info("Stopping consumer task ...")
+        consumer_task.cancel()
+        try:
+            await consumer_task
+        except asyncio.CancelledError:
+            pass
 
     except Exception as e:
         logger.error(f"Processor error: {e}", exc_info=True)
