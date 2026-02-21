@@ -91,6 +91,9 @@ services:
     dockerCommand: python -m workers.message_processor
     region: oregon
     plan: starter
+    # NO healthCheckPath — worker services are long-running background
+    # processes with no HTTP port. Render will kill the container if a
+    # health check is configured and nothing responds on the port.
 
     envVars:
       # PostgreSQL — same database as the API
